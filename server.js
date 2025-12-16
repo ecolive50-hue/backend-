@@ -1,174 +1,171 @@
+
 const express = require("express");
-const cors = require("cors");
-const mongoose = require("mongoose");
 const http = require("http");
 const { Server } = require("socket.io");
+const mongoose = require("mongoose");
+require("dotenv").config();
 
 const app = express();
-app.use(cors());
-app.use(express.json());
-
 const server = http.createServer(app);
+
 const io = new Server(server, {
-  cors: { origin: "*" },
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+  },
 });
 
-/* =========================
+app.use(express.json());
+
+/* ===============================
    MongoDB Connect
-========================= */
+================================ */
 mongoose
-  .connect(process.env.MONGO_URI || "mongodb://127.0.0.1:27017/liveapp")
+  .connect(process.env.MONGO_URI)
   .then(() => console.log("✅ MongoDB connected"))
   .catch((err) => console.log("❌ Mongo error", err));
 
-/* =========================
-   MEMORY STORE
-========================= */
-// roomId => room data
-const rooms = {};
-// userId => coin
-const userCoins = {};
-// roomId => leaderboard {userId: coin}
-const leaderboards = {};
+/* ===============================
+   Schemas
+================================ */
+const UserSchema = new mongoose.Schema({
+  userId: String,
+  name: String,
+  coins: { type: Number, default: 1000 },
+});
 
-/* =========================
-   SOCKET.IO
-========================= */
+const GiftLogSchema = new mongoose.Schema({
+  roomId: String,
+  senderId: String,
+  receiverId: String,
+  giftName: String,
+  price: Number,
+});
+
+const User = mongoose.model("User", UserSchema);
+const GiftLog = mongoose.model("GiftLog", GiftLogSchema);
+
+/* ===============================
+   In-Memory Room Data
+================================ */
+const rooms = {}; 
+/*
+rooms = {
+ roomId: {
+   hostId,
+   seats: [userId|null x8],
+   leaderboard: { userId: coins }
+ }
+}
+*/
+
+/* ===============================
+   Socket Logic
+================================ */
 io.on("connection", (socket) => {
-  console.log("🔌 User connected:", socket.id);
+  console.log("🔗 User connected:", socket.id);
 
-  /* JOIN ROOM */
-  socket.on("join-room", ({ roomId, userId }) => {
+  /* Join Room */
+  socket.on("join-room", async ({ roomId, userId, name }) => {
     socket.join(roomId);
 
     if (!rooms[roomId]) {
       rooms[roomId] = {
+        hostId: userId,
         seats: Array(8).fill(null),
-        locked: Array(8).fill(false),
-        mutedUsers: [],
+        leaderboard: {},
       };
     }
 
-    if (!leaderboards[roomId]) {
-      leaderboards[roomId] = {};
+    let user = await User.findOne({ userId });
+    if (!user) {
+      user = await User.create({ userId, name });
     }
 
-    if (!userCoins[userId]) {
-      userCoins[userId] = 1000; // 🎁 default coin
-    }
-
-    io.to(roomId).emit("room-state", rooms[roomId]);
-    io.to(roomId).emit("leaderboard-update", leaderboards[roomId]);
+    io.to(roomId).emit("room-update", rooms[roomId]);
   });
 
-  /* =========================
-     SEAT SYSTEM
-  ========================= */
+  /* Take Seat */
   socket.on("take-seat", ({ roomId, seatIndex, userId }) => {
-    const room = rooms[roomId];
-    if (!room || room.locked[seatIndex]) return;
+    if (!rooms[roomId]) return;
 
-    room.seats = room.seats.map((u) => (u === userId ? null : u));
-    room.seats[seatIndex] = userId;
-
-    io.to(roomId).emit("room-state", room);
+    rooms[roomId].seats[seatIndex] = userId;
+    io.to(roomId).emit("seat-update", rooms[roomId].seats);
   });
 
-  socket.on("leave-seat", ({ roomId, userId }) => {
-    const room = rooms[roomId];
-    if (!room) return;
+  /* Leave Seat */
+  socket.on("leave-seat", ({ roomId, seatIndex }) => {
+    if (!rooms[roomId]) return;
 
-    room.seats = room.seats.map((u) => (u === userId ? null : u));
-    io.to(roomId).emit("room-state", room);
+    rooms[roomId].seats[seatIndex] = null;
+    io.to(roomId).emit("seat-update", rooms[roomId].seats);
   });
 
-  socket.on("lock-seat", ({ roomId, seatIndex }) => {
-    const room = rooms[roomId];
-    if (!room) return;
-
-    room.locked[seatIndex] = !room.locked[seatIndex];
-    io.to(roomId).emit("room-state", room);
-  });
-
-  /* =========================
-     HOST CONTROL
-  ========================= */
-  socket.on("kick-user", ({ roomId, userId }) => {
-    const room = rooms[roomId];
-    if (!room) return;
-
-    room.seats = room.seats.map((u) => (u === userId ? null : u));
-    io.to(roomId).emit("room-state", room);
-  });
-
+  /* Mute */
   socket.on("mute-user", ({ roomId, userId }) => {
-    const room = rooms[roomId];
-    if (!room) return;
-
-    if (!room.mutedUsers.includes(userId)) {
-      room.mutedUsers.push(userId);
-    }
-
     io.to(roomId).emit("user-muted", { userId });
   });
 
+  /* Unmute */
   socket.on("unmute-user", ({ roomId, userId }) => {
-    const room = rooms[roomId];
-    if (!room) return;
-
-    room.mutedUsers = room.mutedUsers.filter((u) => u !== userId);
     io.to(roomId).emit("user-unmuted", { userId });
   });
 
-  /* =========================
-     🎁 GIFT SYSTEM
-  ========================= */
-  socket.on("send-gift", ({ roomId, from, to, giftId, price }) => {
-    if (!userCoins[from] || userCoins[from] < price) return;
+  /* Send Gift */
+  socket.on(
+    "send-gift",
+    async ({ roomId, senderId, receiverId, giftName, price }) => {
+      const sender = await User.findOne({ userId: senderId });
+      if (!sender || sender.coins < price) return;
 
-    // coin cut
-    userCoins[from] -= price;
+      sender.coins -= price;
+      await sender.save();
 
-    // leaderboard add
-    if (!leaderboards[roomId][to]) {
-      leaderboards[roomId][to] = 0;
+      await GiftLog.create({
+        roomId,
+        senderId,
+        receiverId,
+        giftName,
+        price,
+      });
+
+      if (!rooms[roomId].leaderboard[receiverId]) {
+        rooms[roomId].leaderboard[receiverId] = 0;
+      }
+      rooms[roomId].leaderboard[receiverId] += price;
+
+      io.to(roomId).emit("gift-received", {
+        senderId,
+        receiverId,
+        giftName,
+        price,
+      });
+
+      io.to(roomId).emit(
+        "leaderboard-update",
+        rooms[roomId].leaderboard
+      );
+
+      socket.emit("coin-update", sender.coins);
     }
-    leaderboards[roomId][to] += price;
-
-    io.to(roomId).emit("gift-received", {
-      from,
-      to,
-      giftId,
-      price,
-    });
-
-    io.to(roomId).emit("coin-update", {
-      userId: from,
-      balance: userCoins[from],
-    });
-
-    io.to(roomId).emit(
-      "leaderboard-update",
-      leaderboards[roomId]
-    );
-  });
+  );
 
   socket.on("disconnect", () => {
     console.log("❌ User disconnected:", socket.id);
   });
 });
 
-/* =========================
-   TEST ROUTE
-========================= */
+/* ===============================
+   Test Route
+================================ */
 app.get("/", (req, res) => {
-  res.send("🚀 Live voice backend running");
+  res.send("✅ SONIYA LIVE Backend Running");
 });
 
-/* =========================
-   SERVER START
-========================= */
+/* ===============================
+   Start Server
+================================ */
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () =>
-  console.log(`✅ Server running on port ${PORT}`)
+  console.log(`🚀 Server running on port ${PORT}`)
 );
